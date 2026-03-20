@@ -1,0 +1,16 @@
+[project]
+name = "poc-onedrives"
+version = "0.1.0"
+description = "Flask API for OneDrive integration via Microsoft Graph API"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "flask>=3.1",
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+    "confluent-kafka>=2.6",
+    "flasgger>=0.9.7.1",
+]
+
+[project.scripts]
+start = "main:app"
