@@ -213,6 +213,28 @@ Upload or modify a file in your watched OneDrive folder. The service will automa
 
 ---
 
+## Example output
+
+Events published to the Kafka topic for each OneDrive change type:
+
+**File created**
+
+![File created event](images/created.png)
+
+**File deleted**
+
+![File deleted event](images/deleted.png)
+
+**File renamed**
+
+![File renamed event](images/rename.png)
+
+**File updated**
+
+![File updated event](images/update.png)
+
+---
+
 ## Subscription management
 
 Subscriptions expire (max ~4230 hours for OneDrive). Check expiry and renew before it lapses:
