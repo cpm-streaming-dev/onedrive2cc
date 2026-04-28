@@ -202,12 +202,9 @@ Upload or modify a file in your watched OneDrive folder. The service will automa
   "last_modified_at": "2026-03-19T15:56:54Z",
   "modified_by_name": "John Doe",
   "modified_by_email": "john@example.com",
-  "modified_by_id": "user-guid",
-  "content_base64": "..."
+  "modified_by_id": "user-guid"
 }
 ```
-
-> Files ≥ 5 MB: `content_base64` is omitted, `download_url` is included instead.
 
 ![Confluent Cloud topic messages](images/cc.png)
 
@@ -215,21 +212,71 @@ Upload or modify a file in your watched OneDrive folder. The service will automa
 
 ## Example output
 
-Events published to the Kafka topic for each OneDrive change type:
+Events published to the Kafka topic for each OneDrive change type.
 
-**File created**
+> All events share `event_type: "onedrive.file.updated"` because Microsoft Graph only accepts `updated` as the subscription `change_types` for drive resources. The `updated` notification covers file created, modified, renamed, and deleted changes — the delta API response reveals what actually happened.
+
+### Supported event types
+
+Flow: Graph webhook → `_process_delta()` → `_publish_item()` → Kafka
+
+`event_type` = `"onedrive.file." + effective_type` โดย `effective_type` ถูก **determine โดย code เอง** จากการเปรียบเทียบ delta กับ `item_state.json` ไม่ได้อ่านจาก Graph notification ตรงๆ
+
+| `event_type` | เงื่อนไข |
+|---|---|
+| `onedrive.file.created` | `item_id` ไม่เคยอยู่ใน `item_state.json` มาก่อน |
+| `onedrive.file.updated` | parent เดิม + ชื่อเดิม (content หรือ metadata เปลี่ยน) |
+| `onedrive.file.renamed` | ชื่อเปลี่ยน, parent เดิม — event มี field `previous_name` |
+| `onedrive.file.moved` | parent เปลี่ยน, ชื่อเดิม — event มี field `previous_folder_path` |
+| `onedrive.file.moved_renamed` | ทั้งชื่อและ parent เปลี่ยนพร้อมกัน — มีทั้ง `previous_name` และ `previous_folder_path` |
+| `onedrive.file.deleted` | delta คืน item ที่มี `"deleted"` facet — enrich จาก state ก่อน publish |
+| Folder / root | skip ก่อนถึง logic นี้ — ไม่ถูก publish |
+
+> **Bootstrap run**: ครั้งแรกที่ยังไม่มี `delta_token.json` — code จะ snapshot state ทั้งหมดไว้ใน `item_state.json` แต่ **ไม่ publish event ใดๆ** เพื่อใช้เป็น baseline สำหรับ diff ครั้งถัดไป
+
+---
+
+**File created** — a new file is uploaded to OneDrive
+
+Key fields:
+- `event_type`: `"onedrive.file.created"`
+- ถูก detect เพราะ `item_id` ยังไม่มีใน `item_state.json`
+- `created_at` ≈ `last_modified_at`
 
 ![File created event](images/created.png)
 
-**File deleted**
+---
+
+**File deleted** — a file is moved to the Recycle Bin or permanently removed
+
+Key fields:
+- `event_type`: `"onedrive.file.deleted"`
+- Delta API คืน item ที่มี `"deleted"` facet → code enrich ด้วยข้อมูลเดิมจาก `item_state.json` (ชื่อ, path, mime_type ฯลฯ) ก่อน publish
+- `name`, `folder_path`, `mime_type` มาจาก state ที่บันทึกไว้ก่อนหน้า (Graph ไม่ส่ง metadata ให้สำหรับ deleted item)
 
 ![File deleted event](images/deleted.png)
 
-**File renamed**
+---
+
+**File renamed** — a file is renamed inside OneDrive
+
+Key fields:
+- `event_type`: `"onedrive.file.renamed"`
+- `name` = ชื่อ **ใหม่** หลัง rename
+- `previous_name` = ชื่อเดิมก่อน rename (ดึงจาก `item_state.json`)
+- parent / `folder_path` ไม่เปลี่ยน
 
 ![File renamed event](images/rename.png)
 
-**File updated**
+---
+
+**File updated** — the content or metadata of an existing file is modified
+
+Key fields:
+- `event_type`: `"onedrive.file.updated"`
+- `name` และ parent เดิมไม่เปลี่ยน
+- `last_modified_at` อัปเดตเป็นเวลาที่แก้ไข
+- `file_hash` (`quickXorHash`) เปลี่ยนเมื่อ content เปลี่ยน
 
 ![File updated event](images/update.png)
 
@@ -288,6 +335,13 @@ Swagger UI: `http://localhost:5000/apidocs`
 
 - `tokens.json` is created after login — keep it secret, it contains your OAuth tokens
 - `delta_token.json` is created on first webhook notification — tracks the delta cursor so only new changes are returned on subsequent calls
+- `item_state.json` is created alongside `delta_token.json` on the first webhook notification — stores a snapshot of every known file (`name`, `parent_id`, `folder_path`, `mime_type`, `size`, `web_url`) and is used to determine the true event type on each subsequent notification:
+  - item_id ไม่อยู่ใน state → `created`
+  - `name` เปลี่ยน, parent เดิม → `renamed` (พร้อม `previous_name`)
+  - parent เปลี่ยน, ชื่อเดิม → `moved` (พร้อม `previous_folder_path`)
+  - ทั้ง `name` และ parent เปลี่ยน → `moved_renamed`
+  - ไม่มีอะไรเปลี่ยน → `updated`
+  - delta คืน `"deleted"` facet → `deleted` (enrich ด้วยข้อมูลจาก state เพราะ Graph ไม่ส่ง metadata มาให้)
 - Delegated permissions are used (the app acts on behalf of the logged-in user)
 - Personal Microsoft accounts and business (Entra ID) accounts are both supported via `AZURE_TENANT=common`
 - The app must be running and the tunnel active for notifications to reach it

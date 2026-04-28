@@ -1,7 +1,7 @@
 import os
 import json
-import base64
 import logging
+import threading
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
 
@@ -65,6 +65,7 @@ log = logging.getLogger(__name__)
 
 # ── Kafka producer (lazy init) ────────────────────────────────────────────────
 _producer = None
+_delta_lock = threading.Lock()
 
 
 def get_producer():
@@ -238,6 +239,7 @@ def callback():
         "grant_type": "authorization_code",
     })
     if not resp.ok:
+        log.error("Token exchange failed [%s]: %s", resp.status_code, resp.text)
         return jsonify({"error": "token exchange failed", "details": resp.json()}), 400
 
     data = resp.json()
@@ -468,7 +470,7 @@ def create_subscription():
               default: /me/drive/root
             change_types:
               type: string
-              description: Comma-separated change types
+              description: Change type — OneDrive drive resource supports 'updated' only
               default: updated
             expiration_hours:
               type: integer
@@ -649,6 +651,7 @@ def onedrive_notifications():
 
 
 DELTA_TOKEN_FILE = "delta_token.json"
+ITEM_STATE_FILE = "item_state.json"
 
 
 def _load_delta_token() -> str | None:
@@ -663,106 +666,191 @@ def _save_delta_token(token: str):
         json.dump({"token": token}, f)
 
 
+def _load_item_state() -> dict:
+    if os.path.exists(ITEM_STATE_FILE):
+        with open(ITEM_STATE_FILE) as f:
+            return json.load(f)
+    return {}
+
+
+def _save_item_state(state: dict):
+    with open(ITEM_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
 WATCH_RESOURCE = os.environ.get("WATCH_RESOURCE", "/me/drive/root")
 
 
 def _process_delta(change_type: str):
     """
     Use the OneDrive delta API to get all items changed since the last call.
-    Stores a delta token so each call only returns new changes.
+    Lock prevents concurrent webhook calls from fetching the same delta twice.
     """
-    delta_token = _load_delta_token()
-    if delta_token:
-        url = f"https://graph.microsoft.com/v1.0/me/drive/root/delta?$token={delta_token}"
-    else:
-        url = "https://graph.microsoft.com/v1.0/me/drive/root/delta"
+    with _delta_lock:
+        delta_token = _load_delta_token()
+        is_bootstrap = delta_token is None
 
-    while url:
-        resp = graph_get(url)
-        if not resp.ok:
-            log.error("Delta API error: %s", resp.text)
-            return
-        data = resp.json()
+        url = (f"https://graph.microsoft.com/v1.0/me/drive/root/delta?$token={delta_token}"
+               if delta_token else
+               "https://graph.microsoft.com/v1.0/me/drive/root/delta")
 
-        for item in data.get("value", []):
-            # Skip folders and root
-            if "folder" in item or item.get("root") is not None:
-                continue
-            # Skip deleted items
-            if "deleted" in item:
-                log.info("Item deleted: %s", item.get("id"))
-                continue
-            # Filter by watched folder if configured
-            if WATCH_RESOURCE != "/me/drive/root":
-                folder_name = WATCH_RESOURCE.split(":/")[-1].strip("/")
-                item_path = item.get("parentReference", {}).get("path", "")
-                if folder_name.lower() not in item_path.lower():
-                    log.info("Skipping item outside watched folder: %s", item.get("name"))
+        if is_bootstrap:
+            log.info("No delta token found — bootstrapping item state (no events will be published)")
+
+        item_state = _load_item_state()
+
+        while url:
+            resp = graph_get(url)
+            if not resp.ok:
+                log.error("Delta API error: %s", resp.text)
+                return
+            data = resp.json()
+
+            for item in data.get("value", []):
+                if "folder" in item or item.get("root") is not None:
                     continue
-            _publish_item(item, change_type)
 
-        # Follow @odata.nextLink to page through results
-        url = data.get("@odata.nextLink")
+                item_id = item.get("id")
 
-        # Save delta token from @odata.deltaLink for next notification
-        delta_link = data.get("@odata.deltaLink", "")
-        if delta_link:
-            # Extract token from deltaLink URL
-            token = delta_link.split("$token=")[-1] if "$token=" in delta_link else delta_link
-            _save_delta_token(token)
+                if "deleted" in item:
+                    prev = item_state.pop(item_id, {})
+                    if not is_bootstrap:
+                        parent_ref = item.get("parentReference", {})
+                        enriched = {
+                            **item,
+                            "name": prev.get("name"),
+                            "parentReference": {
+                                "driveId": parent_ref.get("driveId"),
+                                "id": prev.get("parent_id") or parent_ref.get("id"),
+                                "path": prev.get("folder_path"),
+                            },
+                            "file": {"mimeType": prev.get("mime_type")},
+                            "size": prev.get("size"),
+                            "webUrl": prev.get("web_url"),
+                        }
+                        _publish_item(enriched, "deleted")
+                    continue
+
+                if WATCH_RESOURCE != "/me/drive/root":
+                    folder_name = WATCH_RESOURCE.split(":/")[-1].strip("/")
+                    item_path = item.get("parentReference", {}).get("path", "")
+                    if folder_name.lower() not in item_path.lower():
+                        if not is_bootstrap:
+                            log.info("Skipping item outside watched folder: %s", item.get("name"))
+                        continue
+
+                current_name = item.get("name")
+                current_parent_id = item.get("parentReference", {}).get("id")
+
+                if not is_bootstrap:
+                    prev = item_state.get(item_id)
+                    if prev is None:
+                        effective_type = "created"
+                        prev_name = None
+                        prev_folder_path = None
+                    else:
+                        prev_name = prev.get("name")
+                        prev_folder_path = prev.get("folder_path")
+                        name_changed = prev_name != current_name
+                        parent_changed = prev.get("parent_id") != current_parent_id
+                        if name_changed and parent_changed:
+                            effective_type = "moved_renamed"
+                        elif name_changed:
+                            effective_type = "renamed"
+                        elif parent_changed:
+                            effective_type = "moved"
+                        else:
+                            effective_type = change_type
+
+                item_state[item_id] = {
+                    "name": current_name,
+                    "parent_id": current_parent_id,
+                    "folder_path": item.get("parentReference", {}).get("path"),
+                    "mime_type": item.get("file", {}).get("mimeType"),
+                    "size": item.get("size"),
+                    "web_url": item.get("webUrl"),
+                }
+
+                if not is_bootstrap:
+                    _publish_item(
+                        item,
+                        effective_type,
+                        previous_name=prev_name if effective_type in ("renamed", "moved_renamed") else None,
+                        previous_folder_path=prev_folder_path if effective_type in ("moved", "moved_renamed") else None,
+                    )
+
+            url = data.get("@odata.nextLink")
+
+            delta_link = data.get("@odata.deltaLink", "")
+            if delta_link:
+                token = delta_link.split("$token=")[-1] if "$token=" in delta_link else delta_link
+                _save_delta_token(token)
+
+        _save_item_state(item_state)
+        if is_bootstrap:
+            log.info("Bootstrap complete — %d items in state, ready to process events", len(item_state))
 
 
-def _publish_item(meta: dict, change_type: str):
+def _publish_item(
+    meta: dict,
+    change_type: str,
+    previous_name: str | None = None,
+    previous_folder_path: str | None = None,
+):
     item_id = meta.get("id")
+    is_folder = "folder" in meta
 
-    # Skip folders
-    if "folder" in meta:
-        return
-
+    parent_ref = meta.get("parentReference", {})
+    file_facet = meta.get("file", {})
+    folder_facet = meta.get("folder", {})
     last_modified_by = meta.get("lastModifiedBy", {})
-    user_info = last_modified_by.get("user", {})
+    created_by = meta.get("createdBy", {})
+    sharepoint_ids = meta.get("sharepointIds", {})
+    item_kind = "folder" if is_folder else "file"
 
     record = {
         # ── Event envelope ──────────────────────────────────────────
-        "event_type": "onedrive.file." + change_type,
+        "event_type": f"onedrive.{item_kind}." + change_type,
         "event_time": datetime.now(timezone.utc).isoformat(),
         "source": "microsoft-graph/onedrive",
 
         # ── What ────────────────────────────────────────────────────
         "onedrive_item_id": item_id,
         "name": meta.get("name"),
-        "mime_type": meta.get("file", {}).get("mimeType"),
+        "previous_name": previous_name,
+        "mime_type": file_facet.get("mimeType"),
         "size_bytes": meta.get("size"),
+        "child_count": folder_facet.get("childCount"),
         "web_url": meta.get("webUrl"),
+        "etag": meta.get("eTag"),
+        "ctag": meta.get("cTag"),
+        "file_hash": file_facet.get("hashes", {}).get("quickXorHash"),
 
         # ── Where ───────────────────────────────────────────────────
-        "drive_id": meta.get("parentReference", {}).get("driveId"),
-        "folder_path": meta.get("parentReference", {}).get("path"),
+        "drive_id": parent_ref.get("driveId"),
+        "parent_id": parent_ref.get("id"),
+        "folder_path": parent_ref.get("path"),
+        "previous_folder_path": previous_folder_path,
 
         # ── When ────────────────────────────────────────────────────
         "created_at": meta.get("createdDateTime"),
         "last_modified_at": meta.get("lastModifiedDateTime"),
 
-        # ── Who ─────────────────────────────────────────────────────
-        "modified_by_name": user_info.get("displayName"),
-        "modified_by_email": user_info.get("email"),
-        "modified_by_id": user_info.get("id"),
-    }
+        # ── Who (modifier) ──────────────────────────────────────────
+        "modified_by_name": last_modified_by.get("user", {}).get("displayName"),
+        "modified_by_email": last_modified_by.get("user", {}).get("email"),
+        "modified_by_id": last_modified_by.get("user", {}).get("id"),
 
-    # Optionally include base64 content for small files (< 5 MB)
-    file_size = meta.get("size", 0)
-    if file_size and file_size < 5 * 1024 * 1024:
-        content_resp = graph_get(f"/me/drive/items/{item_id}/content", stream=True)
-        if content_resp.ok:
-            record["content_base64"] = base64.b64encode(content_resp.content).decode("ascii")
-        else:
-            log.warning("Could not fetch content for item %s", item_id)
-    else:
-        log.info("Skipping content for large file %s (%d bytes) — adding download_url", item_id, file_size)
-        dl_resp = graph_get(f"/me/drive/items/{item_id}",
-                            params={"$select": "id,@microsoft.graph.downloadUrl"})
-        if dl_resp.ok:
-            record["download_url"] = dl_resp.json().get("@microsoft.graph.downloadUrl")
+        # ── Who (creator) ───────────────────────────────────────────
+        "created_by_name": created_by.get("user", {}).get("displayName"),
+        "created_by_email": created_by.get("user", {}).get("email"),
+        "created_by_id": created_by.get("user", {}).get("id"),
+
+        # ── SharePoint context ───────────────────────────────────────
+        "sharepoint_site_id": sharepoint_ids.get("siteId"),
+        "sharepoint_list_id": sharepoint_ids.get("listId"),
+        "sharepoint_list_item_id": sharepoint_ids.get("listItemId"),
+    }
 
     log.info("Publishing event for file: %s (%s)", meta.get("name"), item_id)
     send_to_kafka(item_id, record)
